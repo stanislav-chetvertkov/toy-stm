@@ -2,6 +2,7 @@ package stm
 
 import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.Future
+import scala.concurrent.ExecutionContext.Implicits.global
 
 object Program {
 
@@ -10,90 +11,163 @@ object Program {
   type IO[A] = Future[A]
 
   sealed trait TVar[A] {
-    def readTVar: STM[A] = STM.Read(this)
-    def writeTVar(a: A): STM[Unit] = STM.Write(this, a)
+    def hash(): Int
+//    def readTVar: STM[A] = {
+//      STM.FlatMap(STM.ReadTVar(this), a => STM.Succeed(() => a))
+//    }
+    def writeTVar(a: A): STM[Unit] = STM.WriteToTVar(this, a)
 
-    def modify(f: A => A): STM[Unit] = for {
-      a <- readTVar
-      _ <- writeTVar(f(a))
-    } yield ()
+    def writeUnsafe(a: A): Unit
+    def readUnsafe: A
+
+//    def modify(f: A => A): STM[Unit] = for {
+//      a <- readTVar
+//      _ <- writeTVar(f(a))
+//    } yield ()
 
     def make(a: A): STM[TVar[A]] = TVar.newTVar(a)
     def makeUnsafe(a: A): TVar[A] = ???
   }
 
   object TVar {
-    def newTVar[A](a: A): STM[TVar[A]] = STM.Pure(() => new TVar[A] {
+
+    def makeUnsafe[A](a: A): TVar[A] = new TVar[A] {
       private val ref = new AtomicReference(a)
-//      def get: A = ref.get()
-//      def set(a: A): Unit = ref.set(a)
+      override def writeUnsafe(a: A): Unit = ref.set(a)
+      override def readUnsafe: A = ref.get()
+
+      override def hash(): Int = ref.hashCode()
+    }
+
+    def newTVar[A](a: A): STM[TVar[A]] = STM.Succeed(() => new TVar[A] {
+      private val ref = new AtomicReference(a)
+      override def writeUnsafe(a: A): Unit = ref.set(a)
+      override def readUnsafe: A = ref.get()
+
+      override def hash(): Int = ref.hashCode()
     })
   }
 
-  // mutable storage cell
-  type IORef[A] = AtomicReference[A]
 
-  object IORef {
-    // manipulated only through the following interface
-    def newIORef[A](a: A): IO[IORef[A]] = Future.successful(new AtomicReference(a))
-    def readIORef[A](ref: IORef[A]): IO[A] = Future.successful(ref.get())
-    def writeIORef[A](ref: IORef[A], a: A): IO[Unit] = Future.successful(ref.set(a))
+  class TLog {
+    private var log: List[TLog.TLogEntry] = List.empty
+
+    def append(entry: TLog.TLogEntry): TLog = {
+      log = log :+ entry
+      this
+    }
+
+    def append(entries: List[TLog.TLogEntry]): TLog = {
+      log = log ++ entries
+      this
+    }
+
+    def getLog: List[TLog.TLogEntry] = log
   }
 
+  // thread-local transaction log contains the reads and tentative writes to TVars
+  object TLog {
+    sealed trait TLogEntry
+    case class ReadTVarEntry(tvar: TVar[?], value: Any) extends TLogEntry
+    case class WriteToTVarEntry[A](tvar: TVar[A], value: A) extends TLogEntry
+
+    val empty = new TLog
+  }
 
   sealed trait STM[A] {
-    def retry: STM[A] = STM.FlatMap(STM.Pure(() => ()), _ => STM.retry)
-    def orElse(that: STM[A]): STM[A] = STM.FlatMap(this, _ => that)
+    //    def retry: STM[A] = STM.FlatMap(STM.Pure(() => ()), _ => STM.retry)
+    //    def orElse(that: STM[A]): STM[A] = STM.FlatMap(this, _ => that)
 
-    def flatMap[B](f: A => STM[B]): STM[B] = this match {
-      case STM.FlatMap(stm, g) => STM.FlatMap(stm, g andThen (_.flatMap(f)))
-      case x => STM.FlatMap(x, f)
-    }
-    def map[B](f: A => B): STM[B] = flatMap(a => STM.Pure(() => f(a)))
+
+    def flatMap[B](f: A => STM[B]): STM[B] =
+      STM.FlatMap(this, f)
+
+    def map[B](f: A => B): STM[B] = flatMap(a => STM.Succeed(() => f(a)))
+
+    def run(): A
   }
 
   object STM {
-    case class JournalEntry(tvar: TVar[?], value: Any)
-    type Journal = List[JournalEntry]
 
-    object Journal {
-      val empty: List[JournalEntry] = List.empty
+    def readTVar[A](tVar: TVar[A]): STM[A] = {
+      ReadTVar(tVar)
     }
 
     // Conceptually, aborts the transaction with no effect, and restarts it at the beginning.
-    def retry[A]: STM[A] = ???
+//    def retry[A]: STM[A] = ???
 
-    case class Read[A](tvar: TVar[A]) extends STM[A]
-    case class Write[A](tvar: TVar[A], value: A) extends STM[Unit]
-    case class Pure[A](a: () => A) extends STM[A]
+    case class ReadTVar[A](tvar: TVar[A]) extends STM[A] {
+      override def run(): A = {
+        println(s"ReadTVar: $tvar")
+        val readUnsafe = tvar.readUnsafe
+        println("read unsafe:" + readUnsafe)
+        TLog.empty.append(TLog.ReadTVarEntry(tvar, readUnsafe))
+        readUnsafe
+      }
+    }
 
-    case class Retry[A]() extends STM[A]
+    case class WriteToTVar[A](tvar: TVar[A], value: A) extends STM[Unit] {
+      override def run(): Unit = {
+        println("WriteToTVar:"+ value)
+        TLog.empty.append(TLog.WriteToTVarEntry(tvar, value))
+        ()
+      }
+    }
 
-    case class FlatMap[A, B](stm: STM[A], f: A => STM[B]) extends STM[B]
+    case class Succeed[A](a: () => A) extends STM[A] {
+      override def run(): A = a()
+    }
+
+    case class Retry[A]() extends STM[A] {
+      //we don't want an empty log to run forever
+      override def run(): A = throw new RuntimeException("retry")
+    }
+
+    case class FlatMap[A1, A2](first: STM[A1], f: A1 => STM[A2]) extends STM[A2] {
+      override def run(): A2 = {
+        println("FlatMap:"+ first)
+        val log = first.run()
+        f(log).run()
+      }
+    }
     
-    // Running the STM monad
-    // stm should have a journal of all the operations that were performed
-    // and when transitioning from STM to IO, we should validate the journal before commiting the changes
-
-    
-    // the journal should appear when evaluating the STM monad
-
     // when atomic is called, the STM checks that the logged accesses are valid
     // i.e no other transaction has modified the data since the transaction started
 
     // if the log is valid, the changes are committed to the heap
-    def atomic[A](stm: STM[A]): IO[A] = {
-      
-      def go(stm: STM[A], journal: Journal): IO[A] = stm match {
-        case Pure(a) => Future.successful(a())
-        case Read(tvar) => tvar.readTVar.flatMap(a => go(a, journal ++ List(JournalEntry(tvar, a))))
-        case Write(tvar, value) => IORef.writeIORef(tvar.asInstanceOf[IORef[A]], value.asInstanceOf[A]).map(_ => ())
-        case FlatMap(stm, f) => go(stm, journal).flatMap(a => go(f(a), journal))
-        case Retry() => Future.failed(new Exception("retry"))
+    def atomic[A](stm: STM[A]): IO[Unit] = {
+      val log = stm.run()
+      println(log)
+
+      def isValid(log: TLog): Boolean = {
+        val entries = log.getLog
+        entries.forall {
+          case TLog.ReadTVarEntry(tvar, value) => tvar.readUnsafe == value
+          case TLog.WriteToTVarEntry(tvar, value) => tvar.readUnsafe == value
+        }
       }
 
-      go(stm, Journal.empty)
+      def commit(log: TLog): Unit = {
+        val entries = log.getLog
+        entries.foreach {
+          case TLog.ReadTVarEntry(tvar, value) => ()
+          case TLog.WriteToTVarEntry(tvar, value) => tvar.writeUnsafe(value)
+        }
+      }
+
+//      if (isValid(log)) {
+//        Future(commit(log))
+//      } else {
+//        atomic(stm)
+//      }
+
+      Future.successful(())
+
     }
+
+
+    // TLog should keep track of all the reads and writes and the corresponding values
+    // if during the commit the values have changed, the transaction should be retried with the new values
     
   }
 
