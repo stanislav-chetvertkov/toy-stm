@@ -2,6 +2,7 @@ package stm
 
 import java.util.concurrent.BlockingQueue
 import java.util.concurrent.atomic.AtomicReference
+import scala.annotation.internal.Alias
 import scala.concurrent.{Future, Promise}
 import scala.concurrent.ExecutionContext.Implicits.global
 
@@ -13,6 +14,7 @@ object Program {
 
   sealed trait TVar[A] {
     def hash(): Int
+    def alias: String
 
     //    def readTVar: STM[A] = {
     //      STM.FlatMap(STM.ReadTVar(this), a => STM.Succeed(() => a))
@@ -28,14 +30,14 @@ object Program {
     //      _ <- writeTVar(f(a))
     //    } yield ()
 
-    def make(a: A): STM[TVar[A]] = TVar.newTVar(a)
+    def make(a: A, alias: String): STM[TVar[A]] = TVar.newTVar(a, alias)
 
     def makeUnsafe(a: A): TVar[A] = ???
   }
 
   object TVar {
 
-    def makeUnsafe[A](a: A): TVar[A] = new TVar[A] {
+    def makeUnsafe[A](a: A, aliasV: String): TVar[A] = new TVar[A] {
       private val ref = new AtomicReference(a)
 
       override def writeUnsafe(a: A): Unit = ref.set(a)
@@ -43,38 +45,23 @@ object Program {
       override def readUnsafe: A = ref.get()
 
       override def hash(): Int = ref.hashCode()
+      override def alias: String = aliasV
     }
 
-    def newTVar[A](a: A): STM[TVar[A]] = STM.Succeed(() => new TVar[A] {
+    def newTVar[A](a: A, aliasV: String): STM[TVar[A]] = STM.Succeed(() => new TVar[A] {
       private val ref = new AtomicReference(a)
 
-      override def writeUnsafe(a: A): Unit = ref.set(a)
+      override def writeUnsafe(a: A): Unit = ref.setRelease(a)
 
       override def readUnsafe: A = ref.get()
 
       override def hash(): Int = ref.hashCode()
+      override def alias: String = aliasV
     })
   }
-
-
-  class TLog {
-    private var log: List[TLog.TLogEntry] = List.empty
-
-    def entries: List[TLog.TLogEntry] = log
-
-    def append(entry: TLog.TLogEntry): TLog = {
-      log = log :+ entry
-      this
-    }
-
-    def append(another: TLog): TLog = {
-      log = log ++ another.entries
-      this
-    }
-
-    def getLog: List[TLog.TLogEntry] = log
-  }
-
+  
+  type TLog = List[TLog.TLogEntry]
+  
   // thread-local transaction log contains the reads and tentative writes to TVars
   // TLog should keep track of all the reads and writes and the corresponding values
   // if during the commit the values have changed, the transaction should be retried with the new values
@@ -83,16 +70,44 @@ object Program {
 
     case class ReadTVarEntry(tvar: TVar[?], value: Any) extends TLogEntry
 
-    case class WriteToTVarEntry[A](tvar: TVar[A], value: A) extends TLogEntry
+    case class WriteToTVarEntry[A](tvar: TVar[A], current: A, tentativeUpdate: A) extends TLogEntry
 
-    val empty = new TLog
+    val empty: TLog = List.empty
 
-    def isValid(log: TLog): Boolean = {
-      val entries = log.getLog
-      entries.forall {
-        case TLog.ReadTVarEntry(tvar, value) => tvar.readUnsafe == value
-        case TLog.WriteToTVarEntry(tvar, value) => tvar.readUnsafe == value
+    // run by only one thread at a time
+    def validate(log: TLog): Option[Map[TVar[?], Any]] = {
+      val entries = log
+
+      // a temporary map of tvar to value
+      // read all the distinct TVars from the log and place them in a map
+      var tvarToValue: Map[TVar[?], Any] = entries.collect {
+        case ReadTVarEntry(tvar, value) => tvar
+        case WriteToTVarEntry(tvar, _, value) => tvar
+      }.distinct.map(tvar => tvar -> tvar.readUnsafe).toMap
+
+      val result = entries.forall {
+        case TLog.ReadTVarEntry(tvar, value) =>
+          println(s"isValid read: ${tvar.alias}, observed: $value, actual: ${tvar.readUnsafe}")
+          tvarToValue.get(tvar) match
+            case Some(v) => v == value
+            case None => false
+
+        case TLog.WriteToTVarEntry(tvar, current, pendingUpdate) =>
+
+          println(s"isValid write: ${tvar.alias}, observed: $current, pending: $pendingUpdate")
+          // update the value in the map
+          tvarToValue.get(tvar) match
+            case Some(v) =>
+              if current == v then
+                tvarToValue = tvarToValue.updated(tvar, pendingUpdate)
+                true
+              else
+                false
+            case None =>
+              false
       }
+
+      if result then Some(tvarToValue) else None
     }
 
   }
@@ -123,17 +138,17 @@ object Program {
 
     case class ReadTVar[A](tvar: TVar[A]) extends STM[A] {
       override def evaluateTentativeUpdates(): STMResult[A] = {
-        println(s"ReadTVar: $tvar")
         val readUnsafe = tvar.readUnsafe
-        println("read unsafe:" + readUnsafe)
-        (readUnsafe, TLog.empty.append(TLog.ReadTVarEntry(tvar, readUnsafe)))
+        println(s"ReadTVar: ${tvar.alias}, observed:$readUnsafe")
+        (readUnsafe, TLog.ReadTVarEntry(tvar, readUnsafe) :: Nil)
       }
     }
 
     case class WriteToTVar[A](tvar: TVar[A], value: A) extends STM[Unit] {
       override def evaluateTentativeUpdates(): STMResult[Unit] = {
-        println("WriteToTVar:" + value)
-        ((), TLog.empty.append(TLog.WriteToTVarEntry(tvar, value)))
+        val unsafe = tvar.readUnsafe
+        println("WriteToTVar:" + tvar.alias + ", observed:" + unsafe + ", pending:" + value)
+        ((), TLog.WriteToTVarEntry(tvar, unsafe, value) :: Nil)
       }
     }
 
@@ -151,10 +166,9 @@ object Program {
 
     case class FlatMap[A1, A2](first: STM[A1], f: A1 => STM[A2]) extends STM[A2] {
       override def evaluateTentativeUpdates(): STMResult[A2] = {
-        println("FlatMap:" + first)
         val (a1, log1) = first.evaluateTentativeUpdates()
         val (a2, log2) = f(a1).evaluateTentativeUpdates()
-        (a2, log1.append(log2))
+        (a2, log1 ++ log2)
       }
     }
 
@@ -164,7 +178,7 @@ object Program {
     // if the log is valid, the changes are committed to the heap
     def atomic[A](stm: STM[A])(using runtime: StmRuntime): IO[A] = {
       val (value, log) = stm.evaluateTentativeUpdates()
-      println("Atomic commit log:" + log.entries)
+      println("Atomic commit log:" + log)
       println("Atomic commit value:" + value)
 
       val promise = Promise[TLogCommitResult]()
@@ -190,18 +204,19 @@ object Program {
 
   case class TLogWithCallback(tlog: TLog, callback: Promise[TLogCommitResult])
 
+//  def commit(log: TLog): Unit = {
+//    val entries = log
+//    entries.foreach {
+//      case TLog.ReadTVarEntry(tvar, value) => ()
+//      case TLog.WriteToTVarEntry(tvar, previous, newValue) => tvar.writeUnsafe(newValue)
+//    }
+//  }
 
-
-
-  def commit(log: TLog): Unit = {
-    val entries = log.getLog
-    entries.foreach {
-      case TLog.ReadTVarEntry(tvar, value) => ()
-      case TLog.WriteToTVarEntry(tvar, value) => tvar.writeUnsafe(value)
+  def commit(output: Map[TVar[?], Any]) = {
+    output.foreach {
+      case (tvar, value) => tvar.writeUnsafe(value.asInstanceOf)
     }
   }
-
-
 
 
 }

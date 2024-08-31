@@ -28,17 +28,18 @@ object StmRuntime {
 
     val job = Future {
       println("Starting TLog processor")
+      
       while (true) {
         val tlogWithCallback = tlogs.take()
         val tlog = tlogWithCallback.tlog
         val callback = tlogWithCallback.callback
 
-        if (TLog.isValid(tlog)) {
-          commit(tlog)
-          callback.success(TLogCommitResult.Committed)
-        } else {
-          callback.success(TLogCommitResult.Rejected)
-        }
+        TLog.validate(tlog) match
+          case Some(value) =>
+            commit(value)
+            callback.success(TLogCommitResult.Committed)
+          case None =>
+            callback.success(TLogCommitResult.Rejected)
       }
     }
 
@@ -49,4 +50,5 @@ object StmRuntime {
     }
 
   }
+  
 }
