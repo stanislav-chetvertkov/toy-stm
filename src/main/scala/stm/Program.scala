@@ -1,7 +1,8 @@
 package stm
 
+import java.util.concurrent.BlockingQueue
 import java.util.concurrent.atomic.AtomicReference
-import scala.concurrent.Future
+import scala.concurrent.{Future, Promise}
 import scala.concurrent.ExecutionContext.Implicits.global
 
 object Program {
@@ -75,6 +76,8 @@ object Program {
   }
 
   // thread-local transaction log contains the reads and tentative writes to TVars
+  // TLog should keep track of all the reads and writes and the corresponding values
+  // if during the commit the values have changed, the transaction should be retried with the new values
   object TLog {
     sealed trait TLogEntry
 
@@ -83,6 +86,15 @@ object Program {
     case class WriteToTVarEntry[A](tvar: TVar[A], value: A) extends TLogEntry
 
     val empty = new TLog
+
+    def isValid(log: TLog): Boolean = {
+      val entries = log.getLog
+      entries.forall {
+        case TLog.ReadTVarEntry(tvar, value) => tvar.readUnsafe == value
+        case TLog.WriteToTVarEntry(tvar, value) => tvar.readUnsafe == value
+      }
+    }
+
   }
 
   type STMResult[A] = (A, TLog)
@@ -97,7 +109,7 @@ object Program {
 
     def map[B](f: A => B): STM[B] = flatMap(a => STM.Succeed(() => f(a)))
 
-    def run(): STMResult[A]
+    def evaluateTentativeUpdates(): STMResult[A]
   }
 
   object STM {
@@ -106,11 +118,11 @@ object Program {
       ReadTVar(tVar)
     }
 
-    // Conceptually, aborts the transaction with no effect, and restarts it at the beginning.
+    // todo: implement, aborts the transaction with no effect, and restarts it at the beginning.
     //    def retry[A]: STM[A] = ???
 
     case class ReadTVar[A](tvar: TVar[A]) extends STM[A] {
-      override def run(): STMResult[A] = {
+      override def evaluateTentativeUpdates(): STMResult[A] = {
         println(s"ReadTVar: $tvar")
         val readUnsafe = tvar.readUnsafe
         println("read unsafe:" + readUnsafe)
@@ -119,14 +131,14 @@ object Program {
     }
 
     case class WriteToTVar[A](tvar: TVar[A], value: A) extends STM[Unit] {
-      override def run(): STMResult[Unit] = {
+      override def evaluateTentativeUpdates(): STMResult[Unit] = {
         println("WriteToTVar:" + value)
         ((), TLog.empty.append(TLog.WriteToTVarEntry(tvar, value)))
       }
     }
 
     case class Succeed[A](a: () => A) extends STM[A] {
-      override def run(): STMResult[A] = {
+      override def evaluateTentativeUpdates(): STMResult[A] = {
         println("Succeed:" + a)
         (a(), TLog.empty)
       }
@@ -134,14 +146,14 @@ object Program {
 
     case class Retry[A]() extends STM[A] {
       //we don't want an empty log to run forever
-      override def run(): STMResult[A] = throw new RuntimeException("retry")
+      override def evaluateTentativeUpdates(): STMResult[A] = throw new RuntimeException("retry")
     }
 
     case class FlatMap[A1, A2](first: STM[A1], f: A1 => STM[A2]) extends STM[A2] {
-      override def run(): STMResult[A2] = {
+      override def evaluateTentativeUpdates(): STMResult[A2] = {
         println("FlatMap:" + first)
-        val (a1, log1) = first.run()
-        val (a2, log2) = f(a1).run()
+        val (a1, log1) = first.evaluateTentativeUpdates()
+        val (a2, log2) = f(a1).evaluateTentativeUpdates()
         (a2, log1.append(log2))
       }
     }
@@ -150,44 +162,46 @@ object Program {
     // i.e no other transaction has modified the data since the transaction started
 
     // if the log is valid, the changes are committed to the heap
-    def atomic[A](stm: STM[A]): IO[Unit] = {
-      val (value, log) = stm.run()
+    def atomic[A](stm: STM[A])(using runtime: StmRuntime): IO[A] = {
+      val (value, log) = stm.evaluateTentativeUpdates()
       println("Atomic commit log:" + log.entries)
       println("Atomic commit value:" + value)
 
-      def isValid(log: TLog): Boolean = {
-        val entries = log.getLog
-        entries.forall {
-          case TLog.ReadTVarEntry(tvar, value) => tvar.readUnsafe == value
-          case TLog.WriteToTVarEntry(tvar, value) => tvar.readUnsafe == value
-        }
+      val promise = Promise[TLogCommitResult]()
+      runtime.publish(log, promise)
+
+      promise.future.flatMap {
+        case TLogCommitResult.Committed =>
+          println("Transaction committed")
+          Future.successful(value)
+        case TLogCommitResult.Rejected =>
+          // retry the transaction
+          println("Transaction rejected, retrying")
+          atomic(stm)
       }
-
-      def commit(log: TLog): Unit = {
-        val entries = log.getLog
-        entries.foreach {
-          case TLog.ReadTVarEntry(tvar, value) => ()
-          case TLog.WriteToTVarEntry(tvar, value) => tvar.writeUnsafe(value)
-        }
-      }
-
-      //      if (isValid(log)) {
-      //        Future(commit(log))
-      //      } else {
-      //        atomic(stm)
-      //      }
-
-      Future.successful(())
-
-      //todo: use a hashmap for the log where key is the reference address of the tvar
-
     }
 
-
-    // TLog should keep track of all the reads and writes and the corresponding values
-    // if during the commit the values have changed, the transaction should be retried with the new values
-
   }
+
+  enum TLogCommitResult {
+    case Committed
+    case Rejected
+  }
+
+  case class TLogWithCallback(tlog: TLog, callback: Promise[TLogCommitResult])
+
+
+
+
+  def commit(log: TLog): Unit = {
+    val entries = log.getLog
+    entries.foreach {
+      case TLog.ReadTVarEntry(tvar, value) => ()
+      case TLog.WriteToTVarEntry(tvar, value) => tvar.writeUnsafe(value)
+    }
+  }
+
+
 
 
 }
