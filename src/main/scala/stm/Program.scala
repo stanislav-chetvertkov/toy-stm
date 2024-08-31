@@ -12,20 +12,23 @@ object Program {
 
   sealed trait TVar[A] {
     def hash(): Int
-//    def readTVar: STM[A] = {
-//      STM.FlatMap(STM.ReadTVar(this), a => STM.Succeed(() => a))
-//    }
+
+    //    def readTVar: STM[A] = {
+    //      STM.FlatMap(STM.ReadTVar(this), a => STM.Succeed(() => a))
+    //    }
     def writeTVar(a: A): STM[Unit] = STM.WriteToTVar(this, a)
 
     def writeUnsafe(a: A): Unit
+
     def readUnsafe: A
 
-//    def modify(f: A => A): STM[Unit] = for {
-//      a <- readTVar
-//      _ <- writeTVar(f(a))
-//    } yield ()
+    //    def modify(f: A => A): STM[Unit] = for {
+    //      a <- readTVar
+    //      _ <- writeTVar(f(a))
+    //    } yield ()
 
     def make(a: A): STM[TVar[A]] = TVar.newTVar(a)
+
     def makeUnsafe(a: A): TVar[A] = ???
   }
 
@@ -33,7 +36,9 @@ object Program {
 
     def makeUnsafe[A](a: A): TVar[A] = new TVar[A] {
       private val ref = new AtomicReference(a)
+
       override def writeUnsafe(a: A): Unit = ref.set(a)
+
       override def readUnsafe: A = ref.get()
 
       override def hash(): Int = ref.hashCode()
@@ -41,7 +46,9 @@ object Program {
 
     def newTVar[A](a: A): STM[TVar[A]] = STM.Succeed(() => new TVar[A] {
       private val ref = new AtomicReference(a)
+
       override def writeUnsafe(a: A): Unit = ref.set(a)
+
       override def readUnsafe: A = ref.get()
 
       override def hash(): Int = ref.hashCode()
@@ -52,13 +59,15 @@ object Program {
   class TLog {
     private var log: List[TLog.TLogEntry] = List.empty
 
+    def entries: List[TLog.TLogEntry] = log
+
     def append(entry: TLog.TLogEntry): TLog = {
       log = log :+ entry
       this
     }
 
-    def append(entries: List[TLog.TLogEntry]): TLog = {
-      log = log ++ entries
+    def append(another: TLog): TLog = {
+      log = log ++ another.entries
       this
     }
 
@@ -68,11 +77,15 @@ object Program {
   // thread-local transaction log contains the reads and tentative writes to TVars
   object TLog {
     sealed trait TLogEntry
+
     case class ReadTVarEntry(tvar: TVar[?], value: Any) extends TLogEntry
+
     case class WriteToTVarEntry[A](tvar: TVar[A], value: A) extends TLogEntry
 
     val empty = new TLog
   }
+
+  type STMResult[A] = (A, TLog)
 
   sealed trait STM[A] {
     //    def retry: STM[A] = STM.FlatMap(STM.Pure(() => ()), _ => STM.retry)
@@ -84,7 +97,7 @@ object Program {
 
     def map[B](f: A => B): STM[B] = flatMap(a => STM.Succeed(() => f(a)))
 
-    def run(): A
+    def run(): STMResult[A]
   }
 
   object STM {
@@ -94,50 +107,53 @@ object Program {
     }
 
     // Conceptually, aborts the transaction with no effect, and restarts it at the beginning.
-//    def retry[A]: STM[A] = ???
+    //    def retry[A]: STM[A] = ???
 
     case class ReadTVar[A](tvar: TVar[A]) extends STM[A] {
-      override def run(): A = {
+      override def run(): STMResult[A] = {
         println(s"ReadTVar: $tvar")
         val readUnsafe = tvar.readUnsafe
         println("read unsafe:" + readUnsafe)
-        TLog.empty.append(TLog.ReadTVarEntry(tvar, readUnsafe))
-        readUnsafe
+        (readUnsafe, TLog.empty.append(TLog.ReadTVarEntry(tvar, readUnsafe)))
       }
     }
 
     case class WriteToTVar[A](tvar: TVar[A], value: A) extends STM[Unit] {
-      override def run(): Unit = {
-        println("WriteToTVar:"+ value)
-        TLog.empty.append(TLog.WriteToTVarEntry(tvar, value))
-        ()
+      override def run(): STMResult[Unit] = {
+        println("WriteToTVar:" + value)
+        ((), TLog.empty.append(TLog.WriteToTVarEntry(tvar, value)))
       }
     }
 
     case class Succeed[A](a: () => A) extends STM[A] {
-      override def run(): A = a()
+      override def run(): STMResult[A] = {
+        println("Succeed:" + a)
+        (a(), TLog.empty)
+      }
     }
 
     case class Retry[A]() extends STM[A] {
       //we don't want an empty log to run forever
-      override def run(): A = throw new RuntimeException("retry")
+      override def run(): STMResult[A] = throw new RuntimeException("retry")
     }
 
     case class FlatMap[A1, A2](first: STM[A1], f: A1 => STM[A2]) extends STM[A2] {
-      override def run(): A2 = {
-        println("FlatMap:"+ first)
-        val log = first.run()
-        f(log).run()
+      override def run(): STMResult[A2] = {
+        println("FlatMap:" + first)
+        val (a1, log1) = first.run()
+        val (a2, log2) = f(a1).run()
+        (a2, log1.append(log2))
       }
     }
-    
+
     // when atomic is called, the STM checks that the logged accesses are valid
     // i.e no other transaction has modified the data since the transaction started
 
     // if the log is valid, the changes are committed to the heap
     def atomic[A](stm: STM[A]): IO[Unit] = {
-      val log = stm.run()
-      println(log)
+      val (value, log) = stm.run()
+      println("Atomic commit log:" + log.entries)
+      println("Atomic commit value:" + value)
 
       def isValid(log: TLog): Boolean = {
         val entries = log.getLog
@@ -155,20 +171,22 @@ object Program {
         }
       }
 
-//      if (isValid(log)) {
-//        Future(commit(log))
-//      } else {
-//        atomic(stm)
-//      }
+      //      if (isValid(log)) {
+      //        Future(commit(log))
+      //      } else {
+      //        atomic(stm)
+      //      }
 
       Future.successful(())
+
+      //todo: use a hashmap for the log where key is the reference address of the tvar
 
     }
 
 
     // TLog should keep track of all the reads and writes and the corresponding values
     // if during the commit the values have changed, the transaction should be retried with the new values
-    
+
   }
 
 
