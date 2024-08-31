@@ -43,12 +43,9 @@ import scala.concurrent.Await
 
   given r: StmRuntime = stm.StmRuntime.default
 
-  STM.atomic(move)
-  STM.atomic(moveReverse)
-  STM.atomic(move)
-  STM.atomic(moveReverse)
-  STM.atomic(move)
-  STM.atomic(moveReverse)
+  // create 50 transactions and another 50 that reverse the previous ones
+  val transactions = (1 to 50).map(_ => STM.atomic(move))
+  val reverseTransactions = (1 to 50).map(_ => STM.atomic(moveReverse))
 
   Thread.sleep(5000)
 
@@ -60,5 +57,7 @@ import scala.concurrent.Await
   val newValueB = Await.result(readB, scala.concurrent.duration.Duration.Inf)
   println(s"New value B: $newValueB")
 
+  assert(newValueA == 0)
+  assert(newValueB == 10)
 
 }

@@ -14,6 +14,7 @@ object Program {
 
   sealed trait TVar[A] {
     def hash(): Int
+
     def alias: String
 
     //    def readTVar: STM[A] = {
@@ -45,6 +46,7 @@ object Program {
       override def readUnsafe: A = ref.get()
 
       override def hash(): Int = ref.hashCode()
+
       override def alias: String = aliasV
     }
 
@@ -56,12 +58,13 @@ object Program {
       override def readUnsafe: A = ref.get()
 
       override def hash(): Int = ref.hashCode()
+
       override def alias: String = aliasV
     })
   }
-  
+
   type TLog = List[TLog.TLogEntry]
-  
+
   // thread-local transaction log contains the reads and tentative writes to TVars
   // TLog should keep track of all the reads and writes and the corresponding values
   // if during the commit the values have changed, the transaction should be retried with the new values
@@ -177,22 +180,23 @@ object Program {
 
     // if the log is valid, the changes are committed to the heap
     def atomic[A](stm: STM[A])(using runtime: StmRuntime): IO[A] = {
-      val (value, log) = stm.evaluateTentativeUpdates()
-      println("Atomic commit log:" + log)
-      println("Atomic commit value:" + value)
-
-      val promise = Promise[TLogCommitResult]()
-      runtime.publish(log, promise)
-
-      promise.future.flatMap {
-        case TLogCommitResult.Committed =>
-          println("Transaction committed")
-          Future.successful(value)
-        case TLogCommitResult.Rejected =>
-          // retry the transaction
-          println("Transaction rejected, retrying")
-          atomic(stm)
-      }
+      for {
+        (value, log) <- Future(stm.evaluateTentativeUpdates())
+        _ = println("Atomic commit log:" + log)
+        _ = println("Atomic commit value:" + value)
+        promise = Promise[TLogCommitResult]()
+        _ = runtime.publish(log, promise)
+        result <- promise.future
+        _ = println("Atomic commit result:" + result)
+        result <- result match
+          case TLogCommitResult.Committed =>
+            println("Transaction committed")
+            Future.successful(value)
+          case TLogCommitResult.Rejected =>
+            // retry the transaction
+            println("Transaction rejected, retrying")
+            atomic(stm)
+      } yield result
     }
 
   }
@@ -204,13 +208,13 @@ object Program {
 
   case class TLogWithCallback(tlog: TLog, callback: Promise[TLogCommitResult])
 
-//  def commit(log: TLog): Unit = {
-//    val entries = log
-//    entries.foreach {
-//      case TLog.ReadTVarEntry(tvar, value) => ()
-//      case TLog.WriteToTVarEntry(tvar, previous, newValue) => tvar.writeUnsafe(newValue)
-//    }
-//  }
+  //  def commit(log: TLog): Unit = {
+  //    val entries = log
+  //    entries.foreach {
+  //      case TLog.ReadTVarEntry(tvar, value) => ()
+  //      case TLog.WriteToTVarEntry(tvar, previous, newValue) => tvar.writeUnsafe(newValue)
+  //    }
+  //  }
 
   def commit(output: Map[TVar[?], Any]) = {
     output.foreach {
