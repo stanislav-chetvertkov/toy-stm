@@ -17,11 +17,9 @@ object Program {
 
     def alias: String
 
-    //    def readTVar: STM[A] = {
-    //      STM.FlatMap(STM.ReadTVar(this), a => STM.Succeed(() => a))
-    //    }
     def writeTVar(a: A): STM[Unit] = STM.WriteToTVar(this, a)
 
+    // only called by the STM runtime
     def writeUnsafe(a: A): Unit
 
     def readUnsafe: A
@@ -31,9 +29,6 @@ object Program {
     //      _ <- writeTVar(f(a))
     //    } yield ()
 
-    def make(a: A, alias: String): STM[TVar[A]] = TVar.newTVar(a, alias)
-
-    def makeUnsafe(a: A): TVar[A] = ???
   }
 
   object TVar {
@@ -121,7 +116,6 @@ object Program {
     //    def retry: STM[A] = STM.FlatMap(STM.Pure(() => ()), _ => STM.retry)
     //    def orElse(that: STM[A]): STM[A] = STM.FlatMap(this, _ => that)
 
-
     def flatMap[B](f: A => STM[B]): STM[B] =
       STM.FlatMap(this, f)
 
@@ -167,7 +161,7 @@ object Program {
       override def evaluateTentativeUpdates(): STMResult[A] = throw new RuntimeException("retry")
     }
 
-    case class FlatMap[A1, A2](first: STM[A1], f: A1 => STM[A2]) extends STM[A2] {
+    private case class FlatMap[A1, A2](first: STM[A1], f: A1 => STM[A2]) extends STM[A2] {
       override def evaluateTentativeUpdates(): STMResult[A2] = {
         val (a1, log1) = first.evaluateTentativeUpdates()
         val (a2, log2) = f(a1).evaluateTentativeUpdates()
@@ -216,11 +210,7 @@ object Program {
   //    }
   //  }
 
-  def commit(output: Map[TVar[?], Any]) = {
-    output.foreach {
-      case (tvar, value) => tvar.writeUnsafe(value.asInstanceOf)
-    }
-  }
+
 
 
 }

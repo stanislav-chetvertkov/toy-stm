@@ -1,10 +1,10 @@
 package stm
 
-import stm.Program.{TLog, TLogCommitResult, TLogWithCallback, commit}
+import stm.Program.{TLog, TLogCommitResult, TLogWithCallback, TVar}
 import stm.StmRuntime.startTLogProcessor
 
-import scala.concurrent.ExecutionContext.Implicits.global
 import java.util.concurrent.BlockingQueue
+import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.{Future, Promise}
 
 class StmRuntime {
@@ -18,9 +18,9 @@ class StmRuntime {
 }
 
 object StmRuntime {
-  
+
   lazy val default = new StmRuntime()
-  
+
   def startTLogProcessor(tlogs: BlockingQueue[TLogWithCallback]): Unit = {
     // start a thread that processes the tlogs
     // if the tlog is valid, commit it and notify the callback
@@ -28,7 +28,7 @@ object StmRuntime {
 
     val job = Future {
       println("Starting TLog processor")
-      
+
       while (true) {
         val tlogWithCallback = tlogs.take()
         val tlog = tlogWithCallback.tlog
@@ -50,5 +50,11 @@ object StmRuntime {
     }
 
   }
-  
+
+  private def commit(output: Map[TVar[?], Any]) = {
+    output.foreach {
+      case (tvar, value) => tvar.writeUnsafe(value.asInstanceOf)
+    }
+  }
+
 }
