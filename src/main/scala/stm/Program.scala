@@ -21,15 +21,10 @@ object Program {
 
     def readTVar: STM[A] = STM.ReadTVar(this)
 
-    // only called by the STM runtime
+    // internal method called only by the STM runtime
     def writeUnsafe(a: A): Unit
 
     def readUnsafe: A
-
-    //    def modify(f: A => A): STM[Unit] = for {
-    //      a <- readTVar
-    //      _ <- writeTVar(f(a))
-    //    } yield ()
 
   }
 
@@ -226,16 +221,5 @@ object Program {
   }
 
   case class TLogWithCallback(tlog: TLog, callback: Promise[TLogCommitResult])
-
-  //  def commit(log: TLog): Unit = {
-  //    val entries = log
-  //    entries.foreach {
-  //      case TLog.ReadTVarEntry(tvar, value) => ()
-  //      case TLog.WriteToTVarEntry(tvar, previous, newValue) => tvar.writeUnsafe(newValue)
-  //    }
-  //  }
-
-
-
 
 }
