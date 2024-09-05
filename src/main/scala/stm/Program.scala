@@ -20,7 +20,7 @@ object Program {
     def writeTVar(a: A): STM[Unit] = STM.WriteToTVar(this, a)
 
     def readTVar: STM[A] = STM.ReadTVar(this)
-    
+
     // only called by the STM runtime
     def writeUnsafe(a: A): Unit
 
@@ -112,11 +112,14 @@ object Program {
 
   }
 
-  type STMResult[A] = (A, TLog)
+  enum STMResult[A] {
+    case Success(value: A, TLog: TLog)
+    case Retry(errorDetails: Option[String])
+  }
+
 
   sealed trait STM[A] {
-    //    def retry: STM[A] = STM.FlatMap(STM.Pure(() => ()), _ => STM.retry)
-    //    def orElse(that: STM[A]): STM[A] = STM.FlatMap(this, _ => that)
+    def orElse(that: STM[A]): STM[A] = STM.OrElse(this, that)
 
     def flatMap[B](f: A => STM[B]): STM[B] =
       STM.FlatMap(this, f)
@@ -124,20 +127,18 @@ object Program {
     def map[B](f: A => B): STM[B] = flatMap(a => STM.Succeed(() => f(a)))
 
     def evaluate(): STMResult[A]
+
   }
 
   object STM {
 
-
-
-    // todo: implement, aborts the transaction with no effect, and restarts it at the beginning.
-    //    def retry[A]: STM[A] = ???
+    def retry[A](): Retry[A] = STM.Retry()
 
     case class ReadTVar[A](tvar: TVar[A]) extends STM[A] {
       override def evaluate(): STMResult[A] = {
         val readUnsafe = tvar.readUnsafe
         println(s"ReadTVar: ${tvar.alias}, observed:$readUnsafe")
-        (readUnsafe, TLog.ReadTVarEntry(tvar, readUnsafe) :: Nil)
+        STMResult.Success(readUnsafe, TLog.ReadTVarEntry(tvar, readUnsafe) :: Nil)
       }
     }
 
@@ -145,27 +146,41 @@ object Program {
       override def evaluate(): STMResult[Unit] = {
         val unsafe = tvar.readUnsafe
         println("WriteToTVar:" + tvar.alias + ", observed:" + unsafe + ", pending:" + value)
-        ((), TLog.WriteToTVarEntry(tvar, unsafe, value) :: Nil)
+        STMResult.Success((), TLog.WriteToTVarEntry(tvar, unsafe, value) :: Nil)
       }
     }
 
     case class Succeed[A](a: () => A) extends STM[A] {
       override def evaluate(): STMResult[A] = {
         println("Succeed:" + a)
-        (a(), TLog.empty)
+        STMResult.Success(a(), TLog.empty)
       }
     }
 
     case class Retry[A]() extends STM[A] {
-      //we don't want an empty log to run forever
-      override def evaluate(): STMResult[A] = throw new RuntimeException("retry")
+      override def evaluate(): STMResult[A] = {
+        STMResult.Retry(None)
+      }
+    }
+
+    private case class OrElse[A](first: STM[A], second: STM[A]) extends STM[A] {
+      override def evaluate(): STMResult[A] = {
+        first.evaluate() match
+          case STMResult.Success(value, log) => STMResult.Success(value, log)
+          case STMResult.Retry(_) => second.evaluate()
+      }
     }
 
     private case class FlatMap[A1, A2](first: STM[A1], f: A1 => STM[A2]) extends STM[A2] {
       override def evaluate(): STMResult[A2] = {
-        val (a1, log1) = first.evaluate()
-        val (a2, log2) = f(a1).evaluate()
-        (a2, log1 ++ log2)
+        first.evaluate() match
+          case STMResult.Success(a1, aTLog) =>
+            f(a1).evaluate() match
+              case STMResult.Success(a2, bTLog) =>
+                STMResult.Success(a2, aTLog ++ bTLog)
+              case STMResult.Retry(errorDetails) => STMResult.Retry(errorDetails)
+
+          case STMResult.Retry(errorDetails) => STMResult.Retry(errorDetails)
       }
     }
 
@@ -174,8 +189,18 @@ object Program {
 
     // if the log is valid, the changes are committed to the heap
     def atomic[A](stm: STM[A])(using runtime: StmRuntime): IO[A] = {
+
+      // optimistic execution
+      def evaluate(stm: STM[A]): Future[(A, TLog)] =
+        Future(stm.evaluate()).flatMap {
+          case STMResult.Success(value, log) => Future.successful((value, log))
+          case STMResult.Retry(errorDetails) =>
+            println(s"Retrying transaction for ${stm.hashCode()}")
+            evaluate(stm)
+        }
+
       for {
-        (value, log) <- Future(stm.evaluate())
+        (value, log) <- evaluate(stm)
         _ = println("Atomic commit log:" + log)
         _ = println("Atomic commit value:" + value)
         promise = Promise[TLogCommitResult]()
