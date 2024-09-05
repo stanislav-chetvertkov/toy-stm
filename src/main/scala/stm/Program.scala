@@ -19,6 +19,8 @@ object Program {
 
     def writeTVar(a: A): STM[Unit] = STM.WriteToTVar(this, a)
 
+    def readTVar: STM[A] = STM.ReadTVar(this)
+    
     // only called by the STM runtime
     def writeUnsafe(a: A): Unit
 
@@ -121,20 +123,18 @@ object Program {
 
     def map[B](f: A => B): STM[B] = flatMap(a => STM.Succeed(() => f(a)))
 
-    def evaluateTentativeUpdates(): STMResult[A]
+    def evaluate(): STMResult[A]
   }
 
   object STM {
 
-    def readTVar[A](tVar: TVar[A]): STM[A] = {
-      ReadTVar(tVar)
-    }
+
 
     // todo: implement, aborts the transaction with no effect, and restarts it at the beginning.
     //    def retry[A]: STM[A] = ???
 
     case class ReadTVar[A](tvar: TVar[A]) extends STM[A] {
-      override def evaluateTentativeUpdates(): STMResult[A] = {
+      override def evaluate(): STMResult[A] = {
         val readUnsafe = tvar.readUnsafe
         println(s"ReadTVar: ${tvar.alias}, observed:$readUnsafe")
         (readUnsafe, TLog.ReadTVarEntry(tvar, readUnsafe) :: Nil)
@@ -142,7 +142,7 @@ object Program {
     }
 
     case class WriteToTVar[A](tvar: TVar[A], value: A) extends STM[Unit] {
-      override def evaluateTentativeUpdates(): STMResult[Unit] = {
+      override def evaluate(): STMResult[Unit] = {
         val unsafe = tvar.readUnsafe
         println("WriteToTVar:" + tvar.alias + ", observed:" + unsafe + ", pending:" + value)
         ((), TLog.WriteToTVarEntry(tvar, unsafe, value) :: Nil)
@@ -150,7 +150,7 @@ object Program {
     }
 
     case class Succeed[A](a: () => A) extends STM[A] {
-      override def evaluateTentativeUpdates(): STMResult[A] = {
+      override def evaluate(): STMResult[A] = {
         println("Succeed:" + a)
         (a(), TLog.empty)
       }
@@ -158,13 +158,13 @@ object Program {
 
     case class Retry[A]() extends STM[A] {
       //we don't want an empty log to run forever
-      override def evaluateTentativeUpdates(): STMResult[A] = throw new RuntimeException("retry")
+      override def evaluate(): STMResult[A] = throw new RuntimeException("retry")
     }
 
     private case class FlatMap[A1, A2](first: STM[A1], f: A1 => STM[A2]) extends STM[A2] {
-      override def evaluateTentativeUpdates(): STMResult[A2] = {
-        val (a1, log1) = first.evaluateTentativeUpdates()
-        val (a2, log2) = f(a1).evaluateTentativeUpdates()
+      override def evaluate(): STMResult[A2] = {
+        val (a1, log1) = first.evaluate()
+        val (a2, log2) = f(a1).evaluate()
         (a2, log1 ++ log2)
       }
     }
@@ -175,7 +175,7 @@ object Program {
     // if the log is valid, the changes are committed to the heap
     def atomic[A](stm: STM[A])(using runtime: StmRuntime): IO[A] = {
       for {
-        (value, log) <- Future(stm.evaluateTentativeUpdates())
+        (value, log) <- Future(stm.evaluate())
         _ = println("Atomic commit log:" + log)
         _ = println("Atomic commit value:" + value)
         promise = Promise[TLogCommitResult]()
